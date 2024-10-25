@@ -34,8 +34,122 @@ def make_parser():
 
 
 def detect():
+    # Setting and directories
+    source, weights, save_txt, imgsz = opt.source, opt.weights[0], opt.save_txt, opt.img_size
+    save_img = not opt.nosave and not source.endswith('.txt')  # Save inference images
+
+    save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # Increment run
+    (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # Make dir
+
+    inf_time = AverageMeter()
+    waste_time = AverageMeter()
+    nms_time = AverageMeter()
+
+    # Load model
+    stride = 32
+    device = select_device(opt.device)
+    half = device.type != 'cpu'  # Half precision only supported on CUDA
+
+    # Use torch.load to load the model
+    model = torch.load(weights, map_location=device)  # Load model with map_location for device
+    if half:
+        model.half()  # To FP16 if using GPU
+    model.eval()  # Set model to evaluation mode
+
+    # Set Dataloader
+    vid_path, vid_writer = None, None
+    dataset = LoadImages(source, img_size=imgsz, stride=stride)
+
+    # Run inference
+    if device.type != 'cpu':
+        model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # Run once
+    t0 = time.time()
+    for path, img, im0s, vid_cap in dataset:
+        img = torch.from_numpy(img).to(device)
+        img = img.half() if half else img.float()  # uint8 to fp16/32
+        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
+
+        # Inference
+        t1 = time_synchronized()
+        [pred, anchor_grid], seg, ll = model(img)
+        t2 = time_synchronized()
+
+        # Waste time: the incompatibility of torch.jit.trace causes extra time consumption in demo version 
+        # but this problem will not appear in official version 
+        tw1 = time_synchronized()
+        pred = split_for_trace_model(pred, anchor_grid)
+        tw2 = time_synchronized()
+
+        # Apply NMS
+        t3 = time_synchronized()
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        t4 = time_synchronized()
+
+        da_seg_mask = driving_area_mask(seg)
+        ll_seg_mask = lane_line_mask(ll)
+
+        # Process detections
+        for i, det in enumerate(pred):  # Detections per image
+            p, s, im0, frame = path, '', im0s, getattr(dataset, 'frame', 0)
+
+            p = Path(p)  # To Path
+            save_path = str(save_dir / p.name)  # img.jpg
+            txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # img.txt
+            s += '%gx%g ' % img.shape[2:]  # Print string
+            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # Normalization gain whwh
+            if len(det):
+                # Rescale boxes from img_size to im0 size
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+                # Print results
+                for c in det[:, -1].unique():
+                    n = (det[:, -1] == c).sum()  # Detections per class
+
+                # Write results
+                for *xyxy, conf, cls in reversed(det):
+                    if save_txt:  # Write to file
+                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # Normalized xywh
+                        line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # Label format
+                        with open(txt_path + '.txt', 'a') as f:
+                            f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+                    if save_img:  # Add bbox to image
+                        plot_one_box(xyxy, im0, line_thickness=3)
+
+            # Print time (inference)
+            print(f'{s}Done. ({t2 - t1:.3f}s)')
+            show_seg_result(im0, (da_seg_mask, ll_seg_mask), is_demo=True)
+
+            # Save results (image with detections)
+            if save_img:
+                if dataset.mode == 'image':
+                    cv2.imwrite(save_path, im0)
+                    print(f"The image with the result is saved in: {save_path}")
+                else:  # 'video' or 'stream'
+                    if vid_path != save_path:  # New video
+                        vid_path = save_path
+                        if isinstance(vid_writer, cv2.VideoWriter):
+                            vid_writer.release()  # Release previous video writer
+                        if vid_cap:  # Video
+                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w, h = im0.shape[1], im0.shape[0]
+                        else:  # Stream
+                            fps, w, h = 30, im0.shape[1], im0.shape[0]
+                            save_path += '.mp4'
+                        vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+                    vid_writer.write(im0)
+
+    inf_time.update(t2 - t1, img.size(0))
+    nms_time.update(t4 - t3, img.size(0))
+    waste_time.update(tw2 - tw1, img.size(0))
+    print('inf : (%.4fs/frame)   nms : (%.4fs/frame)' % (inf_time.avg, nms_time.avg))
+    print(f'Done. ({time.time() - t0:.3f}s)')
+
     # setting and directories
-    source, weights,  save_txt, imgsz = opt.source, opt.weights,  opt.save_txt, opt.img_size
+    source, weights,  save_txt, imgsz = opt.source, opt.weights[0],  opt.save_txt, opt.img_size
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
 
     save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
@@ -47,7 +161,7 @@ def detect():
 
     # Load model
     stride =32
-    model  = torch.jit.load(weights)
+    model = torch.load(weights, map_location=device)
     device = select_device(opt.device)
     half = device.type != 'cpu'  # half precision only supported on CUDA
     model = model.to(device)
