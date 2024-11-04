@@ -3,6 +3,9 @@ import time
 from pathlib import Path
 import cv2
 import torch
+print("CUDA mevcut mu?", torch.cuda.is_available())
+print("CUDA cihaz sayısı:", torch.cuda.device_count())
+print(torch.version.cuda)  # Yüklü PyTorch'un desteklediği CUDA sürümünü gösterir
 
 # Conclude setting / general reprocessing / plots / metrices / datasets
 from utils.utils import \
